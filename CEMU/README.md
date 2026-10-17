@@ -1,0 +1,129 @@
+# CEMU
+
+[![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/cs-qyzhang/CEMU)
+
+**Maintainer**: [Qiuyang Zhang](https://github.com/cs-qyzhang) ([cs.qyzhang@qq.com](mailto:cs.qyzhang@qq.com)), [Jiapin Wang](https://github.com/Emilio597) ([wangjiapin@hust.edu.cn](mailto:wangjiapin@hust.edu.cn))
+
+CEMU is a full-system computational storage drive (CSD) emulation platform that enables accurate and flexible modeling of a wide range of CSD devices. It consists of two major components: a CSD emulator and a CSD-oriented software stack.
+
+There are three repositories:
+
+- [CEMU](https://github.com/cs-qyzhang/CEMU). This repository contains the CSD emulator implementation, built on top of FEMU and QEMU v8.0.
+- [linux-cemu](https://github.com/cs-qyzhang/linux-cemu). The CEMU software stack, based on Linux 6.8. It includes the device memory file system (FDMFS), NVMe driver adaptations, and io_uring adaptations.
+- [ubpf-cemu](https://github.com/cs-qyzhang/ubpf-cemu). The eBPF execution environment, built on uBPF.
+
+To support full-system emulation, CEMU leverages QEMU to emulate CSDs within the guest VM using the host CPU and DRAM.
+
+## Installation
+
+The following steps have been validated on Ubuntu 22.04. When running the commands, please pay attention to your working directory: the three repositories and the VM image folder should be placed under the same directory (e.g., `~/cemu` in our example).
+
+```bash
+# clone code
+~$ mkdir cemu && cd cemu
+~/cemu$ git clone https://github.com/cs-qyzhang/CEMU.git
+~/cemu$ git clone https://github.com/cs-qyzhang/linux-cemu.git
+~/cemu$ git clone https://github.com/cs-qyzhang/ubpf-cemu.git --recurse-submodules
+~/cemu$ sudo ./CEMU/femu-scripts/pkgdep.sh
+# compile modified linux kernel
+~/cemu$ cd linux-cemu
+~/cemu/linux-cemu$ make bzImage -j$(nproc)
+~/cemu/linux-cemu$ cd ..
+# compile ubpf for executing eBPF programs
+~/cemu$ cd ubpf-cemu
+~/cemu/ubpf-cemu$ cmake -S . -B build -DUBPF_ENABLE_TESTS=true
+~/cemu/ubpf-cemu$ cmake --build build --config Release
+~/cemu/ubpf-cemu$ cd ..
+# compile CEMU emulator
+~/cemu$ cd CEMU
+~/cemu/CEMU$ mkdir build && cd build
+~/cemu/CEMU/build$ ../femu-scripts/femu-copy-scripts.sh .
+~/cemu/CEMU/build$ ./femu-compile.sh
+~/cemu/CEMU/build$ cd ../tests/cemu
+~/cemu/CEMU/tests/cemu$ make kernel
+```
+
+## Quick Start
+
+Download our prebuilt VM image based on [DQIB (Debian Quick Image Baker pre-baked images)](https://people.debian.org/~gio/dqib/):
+
+```bash
+~/cemu/CEMU/tests/cemu$ cd ../../../
+~/cemu$ wget https://pub-1ace83dce33440adb973f7f684e6456d.r2.dev/dqib.tar.xz
+~/cemu$ tar -xJf dqib.tar.xz
+```
+
+Start CEMU VM:
+
+```bash
+~/cemu$ cd CEMU/build
+~/cemu$ ./run-csd.sh
+```
+
+Open another terminal and connect to the CEMU VM:
+
+```bash
+~$ ssh root@localhost -p 2222
+```
+
+Mount CSDs inside VM:
+
+```bash
+# inside VM
+root@debian:~# ls
+CEMU  cemu-mount.sh
+root@debian:~# ./cemu-mount.sh
+```
+
+After mounting, you will see three NVMe namespaces exposed by the NVMe CSD:
+
+- `/dev/nvme0n1`: NVM namespace, representing the NAND flash inside the CSD. This is equivalent to a traditional NVMe SSD.
+- `/dev/nvme0m2`: Memory namespace, representing the device memory inside the CSD. By abstracting device memory as a block device and mounting FDMFS on top of it, users can access device memory via file-based operations such as `pread/pwrite`, and enable in-device data copies between NAND and on-device memory via the `copy_file_range` system call.
+- `/dev/nvme0c3`: Compute namespace. CEMU uses this namespace to download and execute CSFs.
+
+You can find more information in our paper and NVMe Computational Storage Specification.
+
+```bash
+root@debian:~# lsblk
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+sda       8:0    0   20G  0 disk 
+`-sda1    8:1    0   20G  0 part /
+sr0      11:0    1 1024M  0 rom  
+nvme0m2 252:0    0    2G  0 disk /mnt/fdm0
+nvme0n1 259:0    0   48G  0 disk /mnt/nvme0
+
+root@debian:~# mount | grep 'nvme\|cemu'
+cemusrc on /root/CEMU type 9p (rw,relatime,access=client,trans=virtio)
+/dev/nvme0n1 on /mnt/nvme0 type ext4 (rw,relatime)
+/dev/nvme0m2 on /mnt/fdm0 type fdmfs (rw,relatime)
+```
+
+Run the examples:
+
+```bash
+# inside VM
+root@debian:~# cd CEMU/tests/cemu/
+root@debian:~CEMU/tests/cemu# make
+root@debian:~CEMU/tests/cemu# ./build/test_fdmfs
+root@debian:~CEMU/tests/cemu# ./build/vadd_example
+root@debian:~CEMU/tests/cemu# ./build/test_p2p
+root@debian:~CEMU/tests/cemu# ./build/test_indirect
+root@debian:~CEMU/tests/cemu# ./build/cemu_benchmark
+```
+
+## Configuration
+
+## Reproduce
+
+## Documentation
+
+For more detailed information, please refer to:
+
+- [CEMU Code Structure](docs/cemu/code-structure.md): Overview of the CEMU codebase architecture, including CSF management, scheduling system, and NVMe CSD command implementation
+- [Developing CSD Applications](docs/cemu/application-development.md): Guide on how to develop Computational Storage Functions (CSFs) for CEMU, including shared library and eBPF program development
+
+## Acknowledgement
+
+CEMU is built upon the widely used SSD emulator [FEMU](https://github.com/MoatLab/FEMU), which provides a system-level, high-fidelity SSD emulation platform. We sincerely thank the FEMU team for their outstanding work.
+
+We thank [Sicen Li](https://github.com/L-LYR) for his earlier implementation of FDMFS.

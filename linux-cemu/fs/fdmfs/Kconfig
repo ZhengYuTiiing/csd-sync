@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config FDMFS_FS
+	tristate "CEMU CSD FDMFS support"
+	select FS_IOMAP
+	depends on NVME_CEMU
+	default y
+	help
+	  CEMU CSD FDMFS support.
