@@ -18,6 +18,8 @@ TARGETS = \
 	$(BUILD_DIR)/cdc_desc.so \
 	$(BUILD_DIR)/read_csf.so \
 	$(BUILD_DIR)/grid_ds.so \
+	$(BUILD_DIR)/grid_pipe.so \
+	$(BUILD_DIR)/grid_rb.so \
 	$(BUILD_DIR)/vadd.bpf.o
 
 all: $(BUILD_DIR) $(TARGETS)
@@ -134,3 +136,13 @@ $(BUILD_DIR)/rsync_match_data.so: rsync_match_data.c cemu_def.h rsync_csd_abi.h 
 $(BUILD_DIR)/grid_ds.so: grid_ds.c cemu_def.h dsync_abi.h chunk_abi.h chunk_gear_v2.h \
                           ../../../hw/femu/backend/csd_fp_crc.h ../../../hw/femu/backend/csd_sha1.h
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ grid_ds.c
+
+# grid-cdc 流水线版：算法与 grid_ds 一致，改成一条命令并发跑 P 个 chunk
+# （nr_concurrent_chunks=P），让闪存读与 CSF 计算重叠。
+$(BUILD_DIR)/grid_pipe.so: grid_pipe.c cemu_def.h dsync_abi.h chunk_abi.h chunk_gear_v2.h \
+                          ../../../hw/femu/backend/csd_fp_crc.h ../../../hw/femu/backend/csd_sha1.h
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ grid_pipe.c
+
+# grid-rb：方案 D 的重建算子（destination=1，设备直接写回闪存）
+$(BUILD_DIR)/grid_rb.so: grid_rb.c cemu_def.h
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ grid_rb.c

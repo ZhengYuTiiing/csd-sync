@@ -120,6 +120,27 @@ struct gd_query_hdr {
     uint64_t nr;
 };
 
+/*
+ * grid_pipe（流水线版）用的 per-chunk 描述符。
+ *
+ * 为什么需要它：indirect 流水线里一条命令并发跑 P 个 chunk，
+ * 但 cparam1/cparam2 是**命令级**的（P 个 chunk 共用），
+ * 而 struct cemu_args 里没有 chunk_id —— CSF 无法自知自己是第几个 chunk。
+ * 于是把「本 chunk 在文件内的起始偏移」放进 per-chunk 的 mr[2]，
+ * 每个 chunk 的 MR 切片指向不同的 FDM 文件区间，CSF 读到的就是自己的基址。
+ *
+ * 只有 mode 3（按区间补算强哈希）需要它：查询表给的是**绝对偏移**，
+ * 不知道基址就无法判断哪些查询落在自己这段里。
+ * mode 1/2 不需要：它们输出 chunk 内相对偏移，由主机侧按基址回填。
+ */
+#define GD_DESC_MAGIC 0x4752445344534331ULL   /* "GRDSDSC1" */
+
+struct gd_desc {
+    uint64_t magic;
+    uint64_t base;          /* 本 chunk 在文件内的起始字节偏移（4KB 对齐） */
+    uint64_t nbytes;        /* 本 chunk 字节数 */
+};
+
 struct gd_query {
     uint64_t off;
     uint64_t len;

@@ -18,7 +18,10 @@ TARGETS = \
 	$(BUILD_DIR)/crc_oob_test \
 	$(BUILD_DIR)/fastsync \
 	$(BUILD_DIR)/dsync \
-	$(BUILD_DIR)/gridds
+	$(BUILD_DIR)/gridds \
+	$(BUILD_DIR)/gridpipe \
+	$(BUILD_DIR)/gridrb \
+	$(BUILD_DIR)/rbcopy
 
 CC = gcc
 CXX = g++
@@ -140,4 +143,16 @@ clean:
 
 # grid-cdc：双 CSD，6 步流程，设备侧只有一个算子 grid_ds.so
 $(BUILD_DIR)/gridds: gridds.cpp $(BUILD_DIR)/libcemu.a
+	$(CXX) $(CXXFLAGS) $(URING_CFLAGS) -o $@ $^ $(URING_LDFLAGS) -luring
+
+# grid-cdc 流水线版：6 步流程同 gridds，每条命令并发 P 个 chunk（-p 可调）
+$(BUILD_DIR)/gridpipe: gridpipe.cpp $(BUILD_DIR)/libcemu.a
+	$(CXX) $(CXXFLAGS) $(URING_CFLAGS) -o $@ $^ $(URING_LDFLAGS) -luring
+
+# 方案 D：重建下沉到 CSD（destination=1，设备直接写回闪存）
+$(BUILD_DIR)/gridrb: gridrb.cpp $(BUILD_DIR)/libcemu.a
+	$(CXX) $(CXXFLAGS) $(URING_CFLAGS) -o $@ $^ $(URING_LDFLAGS) -luring
+
+# 方案 D 的最小验证：设备侧整文件拷贝（destination=1）
+$(BUILD_DIR)/rbcopy: rbcopy.cpp $(BUILD_DIR)/libcemu.a
 	$(CXX) $(CXXFLAGS) $(URING_CFLAGS) -o $@ $^ $(URING_LDFLAGS) -luring

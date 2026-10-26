@@ -398,7 +398,12 @@ static bool copy_range2(int dst_fd, int src_fd, uint64_t dst_off,
     uint64_t done = 0;
 
     while (done < len) {
-        size_t chunk = (size_t)std::min<uint64_t>(1u << 30, len - done);
+        /*
+         * 单次请求长度 1MB，不要给 1GB：实测冷盘 10MB
+         *   chunk=1GB 142ms(74MB/s)  vs  chunk=1MB 113ms(93MB/s)
+         * 大请求会掉进慢路径（纯读 4MB 块也比 1MB 块慢 4 倍）。
+         */
+        size_t chunk = (size_t)std::min<uint64_t>(1u << 20, len - done);
         ssize_t r = copy_file_range(src_fd, &in, dst_fd, &out, chunk, 0);
         if (r > 0) {
             done += (uint64_t)r;
@@ -952,7 +957,18 @@ int main(int argc, char **argv)
          * 匹配表按 tgt_off 升序。命中区间之间未覆盖的部分就是字面量区间，
          * 命中区间则从 f 的 (tgt - delta) 处取 —— 这是移位匹配的关键。
          */
-        uint64_t pos = 0;
+        /*
+         * 先把匹配表合并成连续区间再拷（与 gridds / gridpipe 同一处优化）。
+         * 命中率高时相邻条目在 f' 和 f 里都是连续的，逐个拷就是上千次
+         * 十几 KB 的 copy_file_range —— 冷盘时每次请求的固定开销约 0.4ms，
+         * 而合并成一大段拷只要零头的时间。
+         */
+        struct Run {
+            int64_t  src;
+            uint64_t tgt;
+            uint64_t len;
+        };
+        std::vector<Run> runs;
         for (size_t k = 0; k < mtab.size(); k++) {
             const uint64_t tgt = mtab[k].tgt_off;
             /* 夹到真实文件长度：最后一个扇区可能只用了不到 512B */
@@ -963,6 +979,31 @@ int main(int argc, char **argv)
                 return 1;
             }
             const int64_t src = (int64_t)tgt - deltas[mtab[k].delta_idx];
+            if (len == 0) {
+                continue;
+            }
+            if (!runs.empty()) {
+                Run &c = runs.back();
+                if (tgt < c.tgt + c.len) {
+                    continue;               /* 重叠条目：前一段已覆盖 */
+                }
+                if (tgt == c.tgt + c.len && src == (int64_t)(c.src + c.len)) {
+                    c.len += len;           /* f' 和 f 里都连续 → 并成一段 */
+                    continue;
+                }
+            }
+            Run r;
+            r.src = src;
+            r.tgt = tgt;
+            r.len = len;
+            runs.push_back(r);
+        }
+
+        uint64_t pos = 0;
+        for (size_t k = 0; k < runs.size(); k++) {
+            const uint64_t tgt = runs[k].tgt;
+            const uint64_t len = runs[k].len;
+            const int64_t src = runs[k].src;
 
             /* 空隙 [pos, tgt)：未命中 → 字面量 */
             if (tgt > pos) {

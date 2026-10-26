@@ -413,7 +413,16 @@ static bool copy_range2(int dst_fd, int src_fd, uint64_t dst_off,
     uint64_t done = 0;
 
     while (done < len) {
-        size_t chunk = (size_t)std::min<uint64_t>(1u << 30, len - done);
+        /*
+         * 单次 copy_file_range 的请求长度：1MB，不要给 1GB。
+         * 实测（冷盘，10MB，ext4 on FEMU）：
+         *   chunk=1GB   142 ms  74 MB/s
+         *   chunk=1MB   113 ms  93 MB/s
+         *   chunk=256KB 114 ms  92 MB/s
+         * 大请求会掉进慢路径（纯读也是 4MB 块 168ms vs 1MB 块 41ms，差 4 倍），
+         * 而 1MB 已经贴到设备读(254MB/s)+写(151MB/s)的带宽下限了。
+         */
+        size_t chunk = (size_t)std::min<uint64_t>(1u << 20, len - done);
         ssize_t r = copy_file_range(src_fd, &in, dst_fd, &out, chunk, 0);
         if (r > 0) {
             done += (uint64_t)r;
@@ -1075,12 +1084,48 @@ int main(int argc, char **argv)
     uint64_t reuse_bytes = 0, literal_bytes = 0;
     double t_reuse = 0, t_literal = 0;
     {
-        uint64_t pos = 0;
+        /*
+         * 先把令牌合并成连续区间，再拷。
+         *
+         * 命中率高时，相邻令牌在 f' 和 f 里都是连续的 —— 插入 4KB 的场景
+         * 874 个令牌只被插入点切成 2 段。逐个拷就是 874 次 12KB 的
+         * copy_file_range：冷盘时每次请求的固定开销约 0.4ms，合计 370ms；
+         * 而一次性拷 10MB 只要 142ms。合并后请求数从 874 降到 2。
+         */
+        std::vector<Token> runs;
         for (size_t k = 0; k < tokens.size(); k++) {
             const uint64_t tgt = tokens[k].new_off;
             /* 夹到真实文件长度：最后一个块可能只用了不到 length 字节 */
             const uint64_t len = std::min<uint64_t>(tokens[k].len,
                                                     new_size > tgt ? new_size - tgt : 0);
+            if (len == 0) {
+                continue;
+            }
+            if (!runs.empty()) {
+                Token &c = runs.back();
+                if (tgt < c.new_off + c.len) {
+                    continue;           /* 重叠令牌：前一段已覆盖，跳过 */
+                }
+                if (tgt == c.new_off + c.len &&
+                    tokens[k].old_off == c.old_off + c.len) {
+                    c.len += len;       /* f' 和 f 里都连续 → 并成一段 */
+                    continue;
+                }
+            }
+            Token r;
+            r.old_off = tokens[k].old_off;
+            r.new_off = tgt;
+            r.len = len;
+            runs.push_back(r);
+        }
+        printf("    重建前合并令牌: %zu 条 -> %zu 段连续区间\n",
+               tokens.size(), runs.size());
+
+        uint64_t pos = 0;
+        for (size_t k = 0; k < runs.size(); k++) {
+            const uint64_t tgt = runs[k].new_off;
+            const uint64_t len = runs[k].len;
+
             if (len == 0 || tgt < pos) {
                 continue;   /* 重叠/乱序令牌：前一个已覆盖，跳过 */
             }
@@ -1096,9 +1141,9 @@ int main(int argc, char **argv)
             }
             {
                 const double q0 = now_ms();
-                if (!copy_range2(fd_tgt, fd_old, tgt, tokens[k].old_off, len)) {
+                if (!copy_range2(fd_tgt, fd_old, tgt, runs[k].old_off, len)) {
                     fprintf(stderr, "复用 f[%llu] -> f'[%llu] 失败\n",
-                            (unsigned long long)tokens[k].old_off,
+                            (unsigned long long)runs[k].old_off,
                             (unsigned long long)tgt);
                     return 1;
                 }
