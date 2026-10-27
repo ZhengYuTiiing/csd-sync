@@ -22,7 +22,8 @@
 │       ├── kernel/grid_ds.c   设备侧算子（三种角色合一）
 │       ├── kernel/dsync_abi.h 主机/设备共享的 ABI
 │       ├── vm_setup.sh        虚拟机环境重建 + 数据集生成
-│       └── run_ab3.sh         三组对比脚本
+│       ├── run_ab3.sh         三组对比脚本（A/B/C，旧）
+│       └── run_grid7.sh       七组对比脚本（B/E/F/G/C/H/I，主用）
 ├── linux-cemu/                内核（含 fdmfs、CSD ioctl）
 ├── dqib_amd64-pc/             虚拟机启动盘（image.qcow2 2.8G，别进 git）
 └── vssh.py                    主机 → 虚拟机一键执行命令
@@ -158,7 +159,7 @@ cd ~/cemu && python3 vssh.py "cd /root/CEMU/tests/cemu && ./build/gridds \
 ```
 
 后面还有一张分阶段耗时表（设备 / 主机 / 线上三类分别统计）。
-`设备内算子 build_id = 3` 那行用来确认设备里跑的是哪份 `.so`（见第 7 节）。
+`设备内算子 build_id = 3` 那行用来确认设备里跑的是哪份 `.so`（见第 8 节）。
 
 ---
 
@@ -173,6 +174,9 @@ python3 vssh.py "cd /root/CEMU/tests/cemu && bash ./run_ab3.sh 3 '10MB-insert-4K
 ```
 
 结果写在虚拟机的 `/tmp/ab3_result.txt`。
+
+> **本节已过时**：B（`dsync`）后来改成了主机读 f 现场算校验和，不再走 OOB 网格折叠，
+> 下面对 B 的描述和数字都只反映改动前的版本。当前以第 7 节的七组对比为准。
 
 ### 三组是什么
 
@@ -208,7 +212,81 @@ C 比 B 慢 20~30% 是**结构性**的：C 要读 f' 三遍（CDC 切分 → 补
 
 ---
 
-## 7. 几个会浪费你一整天的坑
+## 7. 七组对比：`run_grid7.sh`
+
+```bash
+# 默认七组、4 个 10M 数据集、每组 5 轮
+cd ~/cemu && python3 vssh.py "cd /root/CEMU/tests/cemu && bash ./run_grid7.sh 5"
+```
+
+结果写在虚拟机的 `/tmp/grid7_result.txt`（可用 `RES=...` 改），控制台打印中位与加速比。
+
+用法：`run_grid7.sh [每组轮数，默认 5] ["数据集列表"]`；要选组用环境变量 `GSET`（默认七个全跑）。
+
+| 字母 | 组 | 二进制 | 弱校验从哪来 | 重建在哪 |
+|---|---|---|---|---|
+| `b` | B dsync | `build/dsync` | 主机读 f **现场算** CRC32C | 主机 |
+| `e` | E rsync | `build/rsync_csd` | 设备内**现场算** fp256 | 主机 |
+| `f` | F sky-f | `build/sync_file` | 设备 OOB 里写时固化的 CRC 槽位 | 主机 |
+| `g` | G sky-c | `build/skysync_c_csd` | **存储层网格折叠**（读 0 字节数据） | 主机 |
+| `c` | C grid | `build/gridds` | 存储层网格折叠 | 主机 |
+| `h` | H +流水 | `build/gridpipe -p P` | 同 C | 主机，每条命令 P 个 chunk 并发 |
+| `i` | I +流水+下沉 | `build/gridrb -p P` | 同 C | 设备，P 个 chunk 并发 |
+
+四组校验和实现（B/E/F/G）统一口径：**弱校验挑候选 → 强校验（真 SHA-1）在主机对候选块算，
+新旧两侧都实算，候选块经 PCIe 读入**。四组都会读文件，差别只在弱校验那一级从哪来。
+
+常用变体：
+
+```bash
+# 只跑一个数据集
+./run_grid7.sh 5 "10MB-insert-4KB"
+
+# 自选组
+GSET="b e g c f" ./run_grid7.sh 5
+
+# 把 D（重建下沉 + 流水线关）加进来，隔离两个自变量
+GSET="c d h i" ./run_grid7.sh 5
+```
+
+D 不在默认七组里。加上它之后：**C/H** = 流水线净收益，**C/D** = 重建下沉净收益，
+**D/I** = 流水线在重建已下沉基础上的净收益。
+
+### 计时与正确性口径
+
+- 外部挂钟（`date +%s%N`）包住整个进程。不用各程序自报的「程序总耗时」——
+  E/F 根本不打印它，七组无法共用。
+- 计时轮统一带 `--no-verify`；正确性由 `sync; echo 1 > /proc/sys/vm/drop_caches`
+  之后 `cmp` 与 f' 逐字节比对。
+- **`drop_caches` 只能写 `1`**，不能写 `2`/`3`，原因见第 8 节第 6 条。
+
+### 我这轮实测（10MB，中位 ms，N=5）
+
+| 数据集 | B dsync | E rsync | F sky-f | G sky-c | C grid | H +流水 | I +流水+下沉 |
+|---|---|---|---|---|---|---|---|
+| 10MB.new | 1349 | 1670 | 1564 | 1183 | 524 | 540 | 428 |
+| 10MB-insert-4KB | 1416 | 1658 | 1430 | 1219 | 525 | 568 | 426 |
+| 10MB-cut-4KB | 1395 | 1601 | 1428 | 1150 | 502 | 556 | 394 |
+| 10MB-inverse-1MB | 1293 | 1492 | 1377 | 1090 | 508 | 528 | 435 |
+
+七组 × 4 数据集，正确性全通过，0 失败。
+
+两个同源对比：
+
+- **G 比 B 快 14~21%**：同为 CDC 分块。G 的弱校验取自存储层网格（折叠 2 ms，读 0 字节数据），
+  B 必须把 f 读进主机现场算 CRC32C。
+- **F 比 E 快 7~16%**：同理，F 的弱校验来自 OOB 里写时固化的 CRC 槽位（读 80 KB）。
+
+差距只有十几个百分点，因为强校验现在占大头——G 的 960 ms 里约 780 ms 在读 f+f' 算 SHA-1。
+弱校验那一级已经从 1350 ms 压到 2 ms，再优化也没有多少可省的了。
+
+> **注意**：这轮数据是在给 `Makefile` 补上 `-O2` 之后测的。此前 `CFLAGS` 里完全没有 `-O`，
+> 所有二进制都是 `-O0`，同一段 SHA-1 代码 3963 ms → 589 ms，差了 6.7 倍。
+> 那之前的任何对比数字都不能再用。
+
+---
+
+## 8. 几个会浪费你一整天的坑
 
 ### 1）改了设备侧算子，必须重启 QEMU 才生效（最重要）
 
@@ -235,7 +313,11 @@ cd ~/cemu && python3 vssh.py "cd /root/CEMU/tests/cemu && ./vm_setup.sh"
 
 ### 3）indirect 流水线的 R 阶段读不进 OOB 网格
 
-R 阶段恒把数据读进 `mr[1]`，`read_mode` 是整条命令一个标志 —— 数据页和 OOB 网格
+R 阶段恒把数据读进 `mr[1]`，`read_mode` 是整条命令一个标志 —— 数据页和 cd /root/CEMU/tests/cemu
+bash vm_setup.sh
+rm -f /mnt/fdm0/* /mnt/fdm1/*     # 把 vm_setup 铺的大槽位全释放
+bash prep_data.sh                 # 只给 E 留 4×16MB
+OOB 网格
 不可能在同一次 R 里同时到位。所以先用 `collect_oob` 把整份网格浅读进常驻 FDM 槽
 （Stage-A），之后每条 CDC 命令里 `mr[2]` 直接指向那个槽。
 
@@ -251,9 +333,16 @@ R 阶段恒把数据读进 `mr[1]`，`read_mode` 是整条命令一个标志 —
 边界退化成「从窗口头每 64KB 一刀」，不再是内容定义的。
 一旦中间有插入，之后永远差一个偏移、再也对齐不上，10MB 插 4KB 的命中率直接卡在 50%。
 
+### 6）`drop_caches` 只能写 `1`
+
+`echo 2` 或 `echo 3` 会连 inode/dentry 一起回收，而 fdmfs 目录项没有 `evict_inode`，
+槽位会整个消失但设备侧内存不释放。表现是下一次 `fallocate` 报 `Cannot allocate memory`，
+或程序挂在 D 状态。所有「槽位莫名消失 / 设备被楔死」的根因都是这一句。
+脚本里已经统一用 `echo 1`，手写命令测单组时别写错。
+
 ---
 
-## 8. 其他脚本
+## 9. 其他脚本
 
 | 脚本 | 用途 |
 |---|---|
@@ -264,7 +353,7 @@ R 阶段恒把数据读进 `mr[1]`，`read_mode` 是整条命令一个标志 —
 
 ---
 
-## 9. Git
+## 10. Git
 
 仓库已连 `https://github.com/ZhengYuTiiing/csd-sync.git`（分支 `main`）。
 
