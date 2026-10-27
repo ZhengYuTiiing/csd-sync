@@ -66,7 +66,7 @@ for ds in $DATASETS; do
         tag=${pair%%:*}; bin=${pair##*:}
         : > /tmp/ab_s; : > /tmp/ab_w
         for i in $(seq 1 "$N"); do
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             t0=$(date +%s%N)
             ( cd /root && LD_LIBRARY_PATH=$LIBS /root/$bin "$OLD" "$NEW" 0 ) \
                 >/tmp/o_ab.txt 2>&1
@@ -88,7 +88,7 @@ for ds in $DATASETS; do
         if [ "$g" = c ]; then bin=dsync2; name=grid-cdc; else bin=dsync; name=grid-no-cdc; fi
         : > /tmp/ab_s; : > /tmp/ab_w; : > /tmp/ab_v
         for i in $(seq 1 "$N"); do
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             t0=$(date +%s%N)
             ( cd $CEMU && ./build/$bin "$OLD" "$NEW" -c 0 -s 1 -o "$OUTDIR/ab_$g.out" ) \
                 >/tmp/o_ab.txt 2>&1

@@ -87,7 +87,7 @@ for ds in $DATASETS; do
     # ---------- 正确性把关：每组跑一次带逐字节校验的 ----------
     echo "  [正确性] 带逐字节校验各跑一次" | tee -a "$RES"
     if [ -x /root/dsync_time_test ]; then
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         LD_LIBRARY_PATH=/root/libs /root/dsync_time_test "$OLD" "$NEW" 0 \
             >/tmp/abcd_o_a.txt 2>&1
         rc_a=$(grep -oE 'reconstructed=[0-9]+' /tmp/abcd_o_a.txt | grep -oE '[0-9]+')
@@ -108,7 +108,7 @@ for ds in $DATASETS; do
         # D 的输出文件按数据集命名并长期保留（见文件头：避免重复付 extent 准备成本）
         [ "$grp" = d ] && out="$OUTDIR/abcd_d_${ds}.out"
 
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         ( cd "$CEMU" && ./build/$bin "$OLD" "$NEW" -c 0 -s 1 -o "$out" ) \
             >/tmp/abcd_o_${grp}.txt 2>&1
         if grep -q '\[PASS\]' /tmp/abcd_o_${grp}.txt; then
@@ -129,7 +129,7 @@ for ds in $DATASETS; do
     for i in $(seq 1 "$N"); do
         # ---- [A] host-rsync ----
         if [ -x /root/dsync_time_test ]; then
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             LD_LIBRARY_PATH=/root/libs /root/dsync_time_test "$OLD" "$NEW" 0 \
                 >/tmp/abcd_o_a.txt 2>&1
             four=$(grep '四项合计'      /tmp/abcd_o_a.txt | f1)
@@ -154,7 +154,7 @@ for ds in $DATASETS; do
             out="$OUTDIR/abcd_${grp}.out"
             [ "$grp" = d ] && out="$OUTDIR/abcd_d_${ds}.out"
 
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             ( cd "$CEMU" && ./build/$bin "$OLD" "$NEW" -c 0 -s 1 --no-verify \
                   -o "$out" ) >/tmp/abcd_o_${grp}.txt 2>&1
             tot=$(grep '程序总耗时' /tmp/abcd_o_${grp}.txt | f1)

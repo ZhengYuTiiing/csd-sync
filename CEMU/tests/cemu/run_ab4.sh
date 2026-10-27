@@ -87,7 +87,7 @@ for ds in $DATASETS; do
         for i in $(seq 1 "$N"); do
             rm -f "$OUT"/*.out /mnt/nvme0/sync/target.bin
             prep_impl "$impl"
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             t0=$(date +%s%N)
             run_impl "$impl" "$OLD" "$NEW" >"/tmp/ab4_${impl}_${ds}.log" 2>&1
             rc=$?

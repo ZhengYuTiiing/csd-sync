@@ -98,7 +98,7 @@ for ds in $DATASETS; do
             prep_impl "$impl" "$OLD" || { echo "  准备失败: $impl"; break; }
 
             sync
-            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+            echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
 
             t0=$(date +%s%N)
             run_impl "$impl" "$OLD" "$NEW" >"/tmp/bench_${impl}_${ds}.log" 2>&1

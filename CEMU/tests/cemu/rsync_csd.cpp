@@ -400,6 +400,16 @@ int main(int argc, char **argv)
     }
     memset(zbuf, 0, (size_t)match_out_cap);
 
+    /*
+     * 回读缓冲同样必须 4KB 对齐：fdmfs 对 pread/pwrite 的用户缓冲区有对齐要求，
+     * 未对齐直接返回 EINVAL（曾用普通 std::vector 回读，导致必然崩溃）。
+     */
+    uint8_t *mbuf = nullptr;
+    if (posix_memalign((void **)&mbuf, 4096, (size_t)match_out_cap) != 0 || !mbuf) {
+        fprintf(stderr, "分配对齐回读缓冲失败\n");
+        return 1;
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     while (base_old_blk < nr_old_pages) {
         const uint32_t pages = (uint32_t)std::min<uint64_t>(
@@ -441,18 +451,17 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        /* 回读本窗口匹配结果 */
-        std::vector<uint8_t> mraw((size_t)match_out_cap);
-        if (pread(m_out, mraw.data(), (size_t)match_out_cap, 0) != (ssize_t)match_out_cap) {
+        /* 回读本窗口匹配结果（对齐缓冲） */
+        if (pread(m_out, mbuf, (size_t)match_out_cap, 0) != (ssize_t)match_out_cap) {
             perror("pread match_out");
             return 1;
         }
-        auto *mhdr = (struct rsync_match_hdr *)mraw.data();
+        auto *mhdr = (struct rsync_match_hdr *)mbuf;
         if (mhdr->magic != RSYNC_MATCH_MAGIC) {
             fprintf(stderr, "匹配结果 magic 错误: 0x%lx\n", (unsigned long)mhdr->magic);
             return 1;
         }
-        auto *tokens = (struct rsync_match_token *)(mraw.data() + sizeof(*mhdr));
+        auto *tokens = (struct rsync_match_token *)(mbuf + sizeof(*mhdr));
         uint32_t take = std::min<uint32_t>(mhdr->nr_matched, pages);
         all_tokens.insert(all_tokens.end(), tokens, tokens + take);
         matched_total += take;
@@ -466,6 +475,7 @@ int main(int argc, char **argv)
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     free(zbuf);
+    free(mbuf);
 
     printf("Phase1 rsync_match_data: 完成, %d 窗口, 命中 %lu 块, 未命中 %lu 块, 耗时 %ld us\n",
            nr_win, (unsigned long)matched_total, (unsigned long)changed_total,

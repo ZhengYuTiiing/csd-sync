@@ -30,7 +30,7 @@ for ds in $DATASETS; do
     for b in dsync_time_test skysync_c_time_test; do
         : > /tmp/dcv
         for i in $(seq 1 "$N"); do
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             ( cd /root && LD_LIBRARY_PATH=/root/libs /root/$b "$OLD" "$DIR/$ds" 0 ) \
                 >/tmp/o_dc.txt 2>&1
             four=$(grep '四项合计' /tmp/o_dc.txt | f1)

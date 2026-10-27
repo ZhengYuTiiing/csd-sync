@@ -1,5 +1,6 @@
 #include <linux/fs.h>
 #include <linux/iomap.h>
+#include <linux/string.h>
 
 #include "fdmfs.h"
 
@@ -22,15 +23,27 @@ static bool fdmfs_empty_dir(struct fdmfs_inode *dir)
 static struct inode *fdmfs_iget(struct super_block *sb, unsigned long ino)
 {
 	struct inode *inode;
-	inode = iget_locked(sb, ino);
 
+	inode = iget_locked(sb, ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW))
-		return inode;
 
-	pr_err("FDMFS: fdmfs_iget cannot find inode from inode cache!\n");
-	return NULL;
+	if (inode->i_state & I_NEW) {
+		/*
+		 * 目录项还在、inode 却已被 VFS 回收：这是一条陈旧记录。
+		 *
+		 * iget_locked 在 cache miss 时会新建一个带 I_NEW 且已锁定的
+		 * inode，调用方必须用 unlock_new_inode() 或 iget_failed()
+		 * 收尾。这里若直接返回，会把一个永远 locked 的 inode 留在
+		 * inode 哈希表里，之后任何一次对同一 ino 的 iget_locked 都会
+		 * 死等 I_NEW —— 表现为进程 D 状态、kill -9 无效，
+		 * 之后连 ls /mnt/fdm0、touch 都一起挂死。
+		 */
+		pr_warn("FDMFS: stale entry (ino %lu), dropping it\n", ino);
+		iget_failed(inode);
+		return NULL;	/* 当作不存在，由调用方走创建路径 */
+	}
+	return inode;
 }
 
 struct inode *fdmfs_icreate(struct fdmfs_sb_info *sbi, struct mnt_idmap *idmap,
@@ -77,7 +90,18 @@ struct inode *fdmfs_icreate(struct fdmfs_sb_info *sbi, struct mnt_idmap *idmap,
 	fdmfs_inode->sbi = sbi;
 	fdmfs_inode->ino = inode->i_ino;
 	fdmfs_inode->inode = inode;
-	fdmfs_inode->name = name;
+	/*
+	 * name 指向 dentry->d_name.name，dentry 销毁后这块内存可能被复用，
+	 * 而 fdmfs_lookup 之后还要拿它做 strcmp —— 必须自己拷一份，
+	 * 否则就是 use-after-free，可能匹配到错误记录、拿到错的 ino。
+	 * fdmfs_inode 本身从不释放，所以这里也不需要额外的释放路径。
+	 */
+	fdmfs_inode->name = (const unsigned char *)kstrdup((const char *)name,
+							  GFP_KERNEL);
+	if (!fdmfs_inode->name) {
+		iput(inode);
+		return ERR_PTR(-ENOMEM);
+	}
 	INIT_LIST_HEAD(&fdmfs_inode->sibling);
 	INIT_LIST_HEAD(&fdmfs_inode->children);
 	return inode;
@@ -92,6 +116,8 @@ static int fdmfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	pr_info("FDMFS: create %s, mode %d\n", dentry->d_name.name, mode);
 
 	inode = fdmfs_icreate(sbi, idmap, dir, mode, dentry->d_name.name);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 	fdmfs_add_entry(FDMFS_I(dir), FDMFS_I(inode));
 	d_instantiate(dentry, inode);
 	return 0;
@@ -100,22 +126,30 @@ static int fdmfs_create(struct mnt_idmap *idmap, struct inode *dir,
 static struct dentry *fdmfs_lookup(struct inode *dir, struct dentry *dentry,
 					unsigned int flags)
 {
-	struct fdmfs_inode *fdmfs_inode, *tmp;
+	struct fdmfs_inode *fdmfs_inode, *tmp, *next;
 	struct inode *inode = NULL;
-	// struct fdmfs_sb_info *sbi = FDMFS_SB(dir->i_sb);
-
-	// pr_info("FDMFS: lookup %s\n", dentry->d_name.name);
 
 	if (dentry->d_name.len > FDMFS_NAMELEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
 	fdmfs_inode = FDMFS_I(dir);
-	list_for_each_entry(tmp, &fdmfs_inode->children, sibling) {
-		if (!strcmp(tmp->name, dentry->d_name.name)) {
-			inode = fdmfs_iget(dir->i_sb, tmp->ino);
-			if (IS_ERR(inode))
-				return ERR_CAST(inode);
+	list_for_each_entry_safe(tmp, next, &fdmfs_inode->children, sibling) {
+		if (strcmp(tmp->name, dentry->d_name.name))
+			continue;
+
+		inode = fdmfs_iget(dir->i_sb, tmp->ino);
+		if (IS_ERR(inode))
+			return ERR_CAST(inode);
+		if (!inode) {
+			/*
+			 * fdmfs_iget 返回 NULL 表示这条目录项已陈旧（inode 被回收）。
+			 * 顺手把它从 children 里摘掉：否则每次 lookup 都会再踩一次，
+			 * 而随后的 create 又会加一条同名记录，越积越多。
+			 * 注意不能 kfree(tmp)：fdmfs_inode 由别处持有且从不释放。
+			 */
+			list_del(&tmp->sibling);
 		}
+		break;
 	}
 	return d_splice_alias(inode, dentry);
 }

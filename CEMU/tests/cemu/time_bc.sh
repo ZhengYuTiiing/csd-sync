@@ -21,7 +21,7 @@ for ds in $DATASETS; do
     : > /tmp/tv
     for i in $(seq 1 "$N"); do
       sync
-      echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+      echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
       if [ "$g" = "B" ]; then
         bin=/root/CEMU/tests/cemu/build/dsync
         out=/mnt/nvme1/sync/t_b.out

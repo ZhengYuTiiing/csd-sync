@@ -44,8 +44,19 @@
 #include "util.h"
 #include "kernel/rsync_csd_abi.h"
 
-/* 与设备侧同源的指纹实现，避免两份代码漂移导致永不匹配 */
+/*
+ * 与设备侧同源的指纹实现，避免两份代码漂移导致永不匹配。
+ *
+ * 设备写路径 backend_fingerprint_range() 往 OOB 固化的是 CRC 槽位
+ * （csd_crc_slot_build：每个 4KB 页 8 个扇区各 4B 的 CRC32C，共 32B），
+ * 不是 csd_fp256 强摘要（后者现在只用于 E 那种"设备内现场算"的路径）。
+ *
+ * F 走的是"浅读 OOB"这条路：rsync_match 拿 OOB 里的 32B 和主机下发的
+ * 新文件指纹表做 memcmp。所以主机侧必须按同一种格式建表，否则
+ * memcmp 永远不相等 —— 表现为 Phase1 命中 0 块、字面量 100%。
+ */
 #include "../../hw/femu/backend/csd_fingerprint.h"
+#include "../../hw/femu/backend/csd_fp_crc.h"
 
 #define CSD_CTL_DEV "/dev/nvme0c3"
 #define CSD_NG_DEV  "/dev/ng0n3"
@@ -389,7 +400,9 @@ int main(int argc, char **argv)
         for (uint32_t i = 0; i < nr_new_pages; i++) {
             ent[i].blk_idx = i;
             ent[i].flags = 0;
-            csd_fp256(new_data.data() + (size_t)i * BLK, BLK, ent[i].fp);
+            /* 必须与设备写路径固化进 OOB 的格式一致（CRC 槽位，32B） */
+            csd_crc_slot_build(new_data.data() + (size_t)i * BLK,
+                               ent[i].fp);
         }
     }
 

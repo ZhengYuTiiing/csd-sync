@@ -56,7 +56,7 @@ for ds in $DATASETS; do
     # ---------- 正确性把关：每组跑一次带逐字节校验的 ----------
     echo "  [正确性] 带逐字节校验各跑一次" | tee -a "$RES"
     if [ -x /root/dsync_time_test ]; then
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         LD_LIBRARY_PATH=/root/libs /root/dsync_time_test "$OLD" "$NEW" 0 \
             >/tmp/o_a.txt 2>&1
         rc_a=$(grep -oE 'reconstructed=[0-9]+' /tmp/o_a.txt | grep -oE '[0-9]+')
@@ -68,7 +68,7 @@ for ds in $DATASETS; do
     fi
     for grp in b c; do
         if [ "$grp" = b ]; then bin=dsync; desc="grid-no-cdc"; else bin=gridds; desc="grid-cdc"; fi
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         ( cd "$CEMU" && ./build/$bin "$OLD" "$NEW" -c 0 -s 1 \
               -o "$OUTDIR/ab_${grp}.out" ) >/tmp/o_${grp}.txt 2>&1
         if grep -q '\[PASS\]' /tmp/o_${grp}.txt; then
@@ -89,7 +89,7 @@ for ds in $DATASETS; do
     for i in $(seq 1 "$N"); do
         # ---- [A] host-rsync ----
         if [ -x /root/dsync_time_test ]; then
-            sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+            sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
             LD_LIBRARY_PATH=/root/libs /root/dsync_time_test "$OLD" "$NEW" 0 \
                 >/tmp/o_a.txt 2>&1
             four=$(grep '四项合计'      /tmp/o_a.txt | f1)
@@ -105,7 +105,7 @@ for ds in $DATASETS; do
         fi
 
         # ---- [B] grid-no-cdc ----
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         ( cd "$CEMU" && ./build/dsync "$OLD" "$NEW" -c 0 -s 1 --no-verify \
               -o "$OUTDIR/ab_b.out" ) >/tmp/o_b.txt 2>&1
         tot=$(grep '程序总耗时' /tmp/o_b.txt | f1)
@@ -117,7 +117,7 @@ for ds in $DATASETS; do
         fi
 
         # ---- [C] grid-cdc ----
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+        sync; echo 1 >/proc/sys/vm/drop_caches 2>/dev/null
         ( cd "$CEMU" && ./build/gridds "$OLD" "$NEW" -c 0 -s 1 --no-verify \
               -o "$OUTDIR/ab_c.out" ) >/tmp/o_c.txt 2>&1
         tot=$(grep '程序总耗时' /tmp/o_c.txt | f1)
