@@ -58,6 +58,7 @@
 #include "kernel/cemu_manifest.h"
 #include "kernel/dsync_abi.h"
 #include "../../hw/femu/backend/csd_fp_crc.h"
+#include "../../hw/femu/backend/csd_sha1.h"
 
 #define PAGE          4096ull
 #define SEC           512ull
@@ -911,6 +912,10 @@ int main(int argc, char **argv)
         free(zero);
     }
 
+    /*
+     * 弱校验走存储层：fold_manifest 读 OOB 网格做折叠，一个字节的 f 数据都不读。
+     * 这正是 sky-c 相对 dsync 的差异化之处 —— dsync 必须把 f 读进主机现场算。
+     */
     struct ioctl_create_mrs mrs_s {};
     prep_mrs(&mrs_s, 4);
     mrs_s.fd[0] = fd_mtab_srv;     mrs_s.off[0] = 0; mrs_s.size[0] = (long long)mtab_io;
@@ -945,6 +950,82 @@ int main(int argc, char **argv)
     printf("[3] server CSD 网格折叠     : 折叠次数 %llu × %llu 候选偏移（上下界相同）, "
            "命令往返 %.2f ms, 扫描 f 的数据字节 0\n",
            (unsigned long long)N, (unsigned long long)nr_deltas, t_srv);
+
+    /* ---------- 3.5 强校验：候选块在主机过 SHA-1，两侧数据都经 PCIe 读入 ---------- */
+    uint64_t nr_matched = 0;
+    {
+        PhaseScope ph("强校验 SHA-1 (server)", PH_HOST);
+
+        uint8_t *tbuf = (uint8_t *)fdm_alloc(mtab_io);
+        if (!tbuf) { fprintf(stderr, "分配对齐缓冲失败\n"); return 1; }
+        if (pread(io_mtab_srv, tbuf, (size_t)mtab_io, 0) != (ssize_t)mtab_io) {
+            perror("pread 匹配表(强校验)");
+            free(tbuf);
+            return 1;
+        }
+
+        int fd_o = open(old_path.c_str(), O_RDONLY);
+        int fd_n = open(new_path.c_str(), O_RDONLY);
+        if (fd_o < 0 || fd_n < 0) { perror("open 强校验"); return 1; }
+
+        std::vector<uint8_t> ob, nb;
+        uint64_t nr_cand = 0, nr_drop = 0, strong_bytes = 0, out = 0;
+        const uint64_t cap = (uint64_t)mtab_io / MATCH_ENT_BYTES;
+
+        for (uint64_t k = 0; k < cap; k++) {
+            struct match_ent e;
+            memcpy(&e, tbuf + k * MATCH_ENT_BYTES, sizeof(e));
+            if (e.len == 0) {
+                break;
+            }
+
+            nr_cand++;
+            const int64_t src = (int64_t)e.tgt_off - deltas[e.delta_idx];
+            if (src < 0) { nr_drop++; continue; }
+
+            ob.resize(e.len);
+            nb.resize(e.len);
+            bool ok = true;
+            for (int side = 0; side < 2 && ok; side++) {
+                uint8_t *p = side ? nb.data() : ob.data();
+                const uint64_t off = side ? e.tgt_off : (uint64_t)src;
+                uint64_t done = 0;
+                while (done < e.len) {
+                    const ssize_t r =
+                        pread(side ? fd_n : fd_o, p + done,
+                              (size_t)(e.len - done), (off_t)(off + done));
+                    if (r <= 0) { ok = false; break; }
+                    done += (uint64_t)r;
+                }
+            }
+            if (!ok) { nr_drop++; continue; }
+
+            uint8_t h_old[CSD_SHA1_LEN], h_new[CSD_SHA1_LEN];
+            csd_sha1(ob.data(), e.len, h_old);
+            csd_sha1(nb.data(), e.len, h_new);
+            strong_bytes += (uint64_t)e.len * 2;   /* f 与 f' 各读一遍 */
+            if (memcmp(h_old, h_new, CSD_SHA1_LEN) != 0) { nr_drop++; continue; }
+
+            memcpy(tbuf + out * MATCH_ENT_BYTES, &e, sizeof(e));
+            out++;
+        }
+        close(fd_o);
+        close(fd_n);
+
+        memset(tbuf + out * MATCH_ENT_BYTES, 0,
+               (size_t)((uint64_t)mtab_io - out * MATCH_ENT_BYTES));
+        if (pwrite(io_mtab_srv, tbuf, (size_t)mtab_io, 0) != (ssize_t)mtab_io) {
+            perror("写匹配表(强校验)");
+            free(tbuf);
+            return 1;
+        }
+        free(tbuf);
+        nr_matched = out;
+
+        printf("    强校验 SHA-1: 候选 %llu 块, 淘汰 %llu 块, 读 f+f' %llu B (经 PCIe)\n",
+               (unsigned long long)nr_cand, (unsigned long long)nr_drop,
+               (unsigned long long)strong_bytes);
+    }
 
     /* ---------- 7. 线上 #2：匹配表 server -> client ---------- */
     std::vector<struct match_ent> mtab;

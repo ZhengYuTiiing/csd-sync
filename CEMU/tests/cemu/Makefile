@@ -25,7 +25,7 @@ TARGETS = \
 
 CC = gcc
 CXX = g++
-CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
+CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g -O2
 CXXFLAGS = $(CFLAGS)
 
 .PHONY: all kernel

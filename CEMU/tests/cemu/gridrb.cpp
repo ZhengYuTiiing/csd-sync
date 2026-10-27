@@ -549,6 +549,63 @@ static bool copy_range2(int dst_fd, int src_fd, uint64_t dst_off,
 
 /* ------------------------------------------------------------------ */
 
+/* ---------- 重建命令的 chunk 切分（P>1 时用） ---------- */
+struct RbChunk {
+    std::vector<NvmeCopyFormat2> in_cf;     /* 源（f）侧 LBA 段 */
+    std::vector<NvmeCopyFormat2> out_cf;    /* 目的（f'）侧 LBA 段，与 in_cf 一一对应 */
+    uint64_t nlb = 0;
+};
+
+/*
+ * 把 [begin,end) 这段 cf 对按每 chunk `per` 个扇区切开。
+ * 源/目的必须同步切（两边长度恒等），否则复用区间会错位。
+ * chunk_nlb 是命令级单值（compute.c:609），所以除了末尾零头，
+ * 每个 chunk 的 nlb 必须精确等于 per —— 零头由调用方退回 P=1 处理。
+ */
+static void split_pairs(const std::vector<NvmeCopyFormat2> &in_cf,
+                        const std::vector<NvmeCopyFormat2> &out_cf,
+                        size_t begin, size_t end, uint64_t per,
+                        std::vector<RbChunk> &out)
+{
+    RbChunk cur;
+    bool open = false;
+    uint64_t in_cur = 0;
+
+    for (size_t i = begin; i < end; i++) {
+        uint64_t n = (uint64_t)in_cf[i].nlb + 1;
+        uint64_t slba_in = in_cf[i].slba;
+        uint64_t slba_out = out_cf[i].slba;
+
+        while (n > 0) {
+            if (!open || in_cur == per) {
+                if (open) {
+                    out.push_back(cur);
+                }
+                cur = RbChunk();
+                open = true;
+                in_cur = 0;
+            }
+            const uint64_t take = std::min(n, per - in_cur);
+            NvmeCopyFormat2 a = in_cf[i];
+            a.slba = slba_in;
+            a.nlb = (uint32_t)(take - 1);
+            NvmeCopyFormat2 b = out_cf[i];
+            b.slba = slba_out;
+            b.nlb = (uint32_t)(take - 1);
+            cur.in_cf.push_back(a);
+            cur.out_cf.push_back(b);
+            cur.nlb += take;
+            in_cur += take;
+            slba_in += take;
+            slba_out += take;
+            n -= take;
+        }
+    }
+    if (open && cur.nlb > 0) {
+        out.push_back(cur);
+    }
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -557,6 +614,7 @@ int main(int argc, char **argv)
     std::string old_path, new_path, tgt_path;
     uint64_t win_mb = DEF_WIN_MB;
     int client_dev = 0, server_dev = 1;
+    int P = 1;                  /* 重建命令的 chunk 并发度；1 = 不开流水线 */
     bool verify = true;
 
     for (int i = 1; i < argc; i++) {
@@ -566,12 +624,17 @@ int main(int argc, char **argv)
             tgt_path = argv[++i];
         } else if (!strcmp(argv[i], "-w") && i + 1 < argc) {
             win_mb = strtoull(argv[++i], nullptr, 10);
+        } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
+            P = atoi(argv[++i]);
+            if (P < 1) {
+                P = 1;
+            }
         } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             client_dev = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             server_dev = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("用法: %s <server:f> <client:f'> [-o target] [-w MB] [-c N] [-s N]\n",
+            printf("用法: %s <server:f> <client:f'> [-o target] [-w MB] [-p P] [-c N] [-s N]\n",
                    argv[0]);
             return 0;
         } else if (old_path.empty()) {
@@ -584,7 +647,7 @@ int main(int argc, char **argv)
         }
     }
     if (old_path.empty() || new_path.empty()) {
-        fprintf(stderr, "用法: %s <server:f> <client:f'> [-o target] [-w MB] [-c N] [-s N]\n",
+        fprintf(stderr, "用法: %s <server:f> <client:f'> [-o target] [-w MB] [-p P] [-c N] [-s N]\n",
                 argv[0]);
         return 1;
     }
@@ -1361,6 +1424,13 @@ int main(int argc, char **argv)
              * 单条命令的数据上限 8MB。cparam1 是命令级参数（P 个 chunk 共用），
              * CSF 靠它知道本次读入多少字节，所以一条命令内只能有一轮 IO ——
              * 超过上限就拆成多条命令，每条各自算准自己的长度。
+             *
+             * -p P 让一条命令内并发 P 个 chunk：indirect_main 会把 mr_addr 按
+             *   chunk 偏移后再交给 CSF（compute.c:1037-1051），grid_rb 看到的
+             *   仍是自己的 mr[0]/mr[1]，所以设备侧算子不用改。约束是
+             *   chunk_nlb 为命令级单值、各 chunk 必须等长，且 numr 能被 P 整除
+             *   （compute.c:633）—— 这里 numr = 2*P。
+             *   尾部不足 P*per 的零头退回 P=1 单独一条命令。
              */
             const uint64_t cap_nlb = 16384;                 /* 8MB */
             const uint64_t cap_bytes = round_up_4k(cap_nlb * SEC);
@@ -1371,74 +1441,118 @@ int main(int argc, char **argv)
                 return 1;
             }
 
-            struct ioctl_create_mrs mrs {};
-            prep_mrs(&mrs, 2);
-            mrs.fd[0] = fd_out_buf;
-            mrs.off[0] = 0;
-            mrs.size[0] = (long long)cap_bytes;
-            mrs.fd[1] = fd_in_buf;
-            mrs.off[1] = 0;
-            mrs.size[1] = (long long)cap_bytes;
-            if (ioctl(srv.ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs) != 0) {
-                perror("CREATE_MRS(重建)");
-                return 1;
-            }
+            /* 每 chunk 扇区数：取 4KB 对齐，且 P 份仍不超过单条命令上限 */
+            const uint64_t per = P > 1 ? (cap_nlb / (uint64_t)P / 8) * 8 : cap_nlb;
+            const bool use_p = (P > 1 && per >= 8);
 
             size_t i = 0;
             int nr_cmd = 0;
             bool dev_ok = true;
             while (i < in_cf.size() && dev_ok) {
+                const uint64_t batch_cap = use_p ? per * (uint64_t)P : cap_nlb;
                 size_t j = i;
                 uint64_t acc = 0;
                 while (j < in_cf.size()) {
                     const uint64_t s = (uint64_t)in_cf[j].nlb + 1;
-                    if (j > i && acc + s > cap_nlb) {
+                    if (j > i && acc + s > batch_cap) {
                         break;
                     }
                     acc += s;
                     j++;
                 }
-                const uint64_t bytes = acc * SEC;
-                const int n_pc = (int)(j - i);
 
-                const size_t need = calc_indirect_task_buffer_size(1, 1, n_pc, n_pc, 0);
+                std::vector<RbChunk> chunks;
+                int Pw = 1;
+                uint64_t chunk_nlb = acc;
+
+                if (use_p && acc == per * (uint64_t)P) {
+                    split_pairs(in_cf, out_cf, i, j, per, chunks);
+                    if ((int)chunks.size() == P) {
+                        Pw = P;
+                        chunk_nlb = per;
+                    } else {
+                        chunks.clear();
+                    }
+                }
+                if (Pw == 1) {
+                    RbChunk one;
+                    one.in_cf.assign(in_cf.begin() + i, in_cf.begin() + j);
+                    one.out_cf.assign(out_cf.begin() + i, out_cf.begin() + j);
+                    one.nlb = acc;
+                    chunks.push_back(one);
+                }
+
+                const uint64_t chunk_bytes = round_up_4k(chunk_nlb * SEC);
+
+                struct ioctl_create_mrs mrs {};
+                prep_mrs(&mrs, 2 * Pw);
+                for (int k = 0; k < Pw; k++) {
+                    mrs.fd[2*k + 0] = fd_out_buf;
+                    mrs.off[2*k + 0] = (long long)((uint64_t)k * chunk_bytes);
+                    mrs.size[2*k + 0] = (long long)chunk_bytes;
+                    mrs.fd[2*k + 1] = fd_in_buf;
+                    mrs.off[2*k + 1] = (long long)((uint64_t)k * chunk_bytes);
+                    mrs.size[2*k + 1] = (long long)chunk_bytes;
+                }
+                if (ioctl(srv.ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs) != 0) {
+                    perror("CREATE_MRS(重建)");
+                    return 1;
+                }
+
+                std::vector<NvmeCopyFormat2> all_in, all_out;
+                std::vector<int> ncf_in(Pw, 0), ncf_out(Pw, 0);
+                for (int k = 0; k < Pw; k++) {
+                    ncf_in[k]  = (int)chunks[k].in_cf.size();
+                    ncf_out[k] = (int)chunks[k].out_cf.size();
+                    all_in.insert(all_in.end(),
+                                  chunks[k].in_cf.begin(), chunks[k].in_cf.end());
+                    all_out.insert(all_out.end(),
+                                   chunks[k].out_cf.begin(), chunks[k].out_cf.end());
+                }
+
+                const size_t need = calc_indirect_task_buffer_size(Pw, 1, (int)all_in.size(),
+                                                                   (int)all_out.size(), 0);
                 std::vector<uint8_t> task(need, 0);
-                size_t packed = pack_indirect_task_buffer(task.data(), 1, 1,
+                size_t packed = pack_indirect_task_buffer(task.data(), Pw, 1,
                                                           CSD_READ_MODE_DATA,
-                                                          n_pc, &n_pc, &in_cf[i],
-                                                          n_pc, &n_pc, &out_cf[i],
+                                                          (int)all_in.size(), ncf_in.data(),
+                                                          all_in.data(),
+                                                          (int)all_out.size(), ncf_out.data(),
+                                                          all_out.data(),
                                                           nullptr, 0);
+                struct nvme_uring_cmd cmd {};
                 if (packed != need) {
                     fprintf(stderr, "重建任务打包长度不符 %zu != %zu\n", packed, need);
                     dev_ok = false;
-                    break;
+                } else {
+                    prep_nvme_uring_program_execute(&cmd, chunk_nlb * SEC, 0, pind_rb,
+                                                    mrs.rsid, 2, 0,
+                                                    (uint32_t)(chunk_nlb - 1), 0,
+                                                    task.data(), (uint32_t)packed);
+                    long long rr = -1;
+                    if (submit_execute_cmd(srv.ng_fd, &cmd, &rr) < 0) {
+                        fprintf(stderr, "设备内重建命令失败\n");
+                        dev_ok = false;
+                    }
                 }
 
-                struct nvme_uring_cmd cmd {};
-                prep_nvme_uring_program_execute(&cmd, bytes, 0, pind_rb, mrs.rsid,
-                                                2, 0, (uint32_t)(acc - 1), 0,
-                                                task.data(), (uint32_t)packed);
-                long long rr = -1;
-                if (submit_execute_cmd(srv.ng_fd, &cmd, &rr) < 0) {
-                    fprintf(stderr, "设备内重建命令失败\n");
-                    dev_ok = false;
+                {
+                    struct ioctl_create_mrs dm {};
+                    dm.rsid = mrs.rsid;
+                    ioctl(srv.ctl_fd, IOCTL_CEMU_DELETE_MRS, &dm);
+                }
+                if (!dev_ok) {
                     break;
                 }
                 nr_cmd++;
                 i = j;
             }
-
-            {
-                struct ioctl_create_mrs dm {};
-                dm.rsid = mrs.rsid;
-                ioctl(srv.ctl_fd, IOCTL_CEMU_DELETE_MRS, &dm);
-            }
             if (!dev_ok) {
                 return 1;
             }
-            printf("    设备内重建: %zu 对 cf / %d 条命令，单条上限 %llu KB\n",
+            printf("    设备内重建: %zu 对 cf / %d 条命令，单条上限 %llu KB，P=%d\n",
                    in_cf.size(), nr_cmd,
-                   (unsigned long long)(cap_nlb * SEC / 1024));
+                   (unsigned long long)(cap_nlb * SEC / 1024), P);
         }
         t_reuse = now_ms() - q0;
 

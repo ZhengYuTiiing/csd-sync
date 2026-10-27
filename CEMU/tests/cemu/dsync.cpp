@@ -57,6 +57,7 @@
 #include "kernel/chunk_abi.h"
 #include "kernel/cemu_manifest.h"
 #include "../../hw/femu/backend/csd_fp_crc.h"
+#include "../../hw/femu/backend/csd_sha1.h"
 
 #define PAGE          4096ull
 #define SEC           512ull
@@ -860,40 +861,140 @@ int main(int argc, char **argv)
         free(zero);
     }
 
-    struct ioctl_create_mrs mrs_s {};
-    prep_mrs(&mrs_s, 4);
-    mrs_s.fd[0] = fd_mtab_srv;     mrs_s.off[0] = 0; mrs_s.size[0] = (long long)mtab_io;
-    mrs_s.fd[1] = fd_grid;         mrs_s.off[1] = 0; mrs_s.size[1] = (long long)grid_io;
-    mrs_s.fd[2] = fd_manifest_srv; mrs_s.off[2] = 0; mrs_s.size[2] = (long long)round_up_4k(manifest_bytes);
-    mrs_s.fd[3] = fd_par;          mrs_s.off[3] = 0; mrs_s.size[3] = (long long)par_io;
-    {
-        PhaseScope ph("CREATE_MRS (server)", PH_HOST);
-        if (ioctl(srv.ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs_s) != 0) {
-            perror("CREATE_MRS(server)");
-            return 1;
-        }
-    }
-
+    /*
+     * 主机侧比对：不再用 fold_manifest 走 OOB 网格，改成把 f 经 PCIe 读进
+     * 主机内存，按清单逐条算 CRC32C 再比对。
+     * CRC32C 复用设备侧同一份实现（csd_fp_crc.h），保证与 client 清单里的
+     * crc32c 位级一致（同为标准 Castagnoli，init/xorout 都是 0xFFFFFFFF）。
+     */
     long long r_fold = -1;
     double t_srv = 0;
+    uint64_t nr_matched = 0;
     {
-        PhaseScope ph("网格折叠 (server)", PH_DEVICE);
+        PhaseScope ph("主机读 f + 折叠 (server)", PH_HOST);
         const double f0 = now_ms();
-        if (run_indirect(srv.ng_fd, pind_fold, mrs_s.rsid,
-                         N, 0,
-                         CSD_READ_MODE_OOB, 0,
-                         old_cf, nr_old_cf, (uint32_t)(old_nlb - 1),
-                         nullptr, 0, &r_fold) < 0) {
-            fprintf(stderr, "[server] 折叠失败\n");
+
+        std::vector<uint8_t> old_data((size_t)old_size);
+        {
+            int fd = open(old_path.c_str(), O_RDONLY);
+            if (fd < 0) { perror("open f(折叠)"); return 1; }
+            size_t got = 0;
+            while (got < old_data.size()) {
+                ssize_t r = read(fd, old_data.data() + got, old_data.size() - got);
+                if (r <= 0) { perror("read f(折叠)"); close(fd); return 1; }
+                got += (size_t)r;
+            }
+            close(fd);
+        }
+
+        uint8_t *mtab_out = (uint8_t *)fdm_alloc(mtab_io);
+        if (!mtab_out) { fprintf(stderr, "分配对齐缓冲失败\n"); return 1; }
+        memset(mtab_out, 0, (size_t)mtab_io);
+
+        const struct manifest_ent *me = (const struct manifest_ent *)manifest.data();
+        const uint64_t old_bytes = old_nlb * SEC;
+
+        /*
+         * 强校验要用的 f' 侧数据：清单里的 CRC32C 只当弱哈希挑候选，
+         * 候选块必须再过一道真 SHA-1。老侧取已在内存的 old_data，
+         * 新侧经 PCIe pread 读入。
+         */
+        int fd_new_sv = open(new_path.c_str(), O_RDONLY);
+        if (fd_new_sv < 0) {
+            perror("open f'(强校验)");
+            free(mtab_out);
             return 1;
         }
+        std::vector<uint8_t> nbuf;
+        uint64_t nr_cand_sh = 0, nr_strong_drop = 0, strong_bytes = 0;
+
+        for (uint64_t i = 0; i < N; i++) {
+            const uint64_t tgt = me[i].off;
+            const uint64_t len = me[i].len;
+            int64_t found = -1;
+
+            for (uint64_t d = 0; d < nr_deltas && found < 0; d++) {
+                const int64_t delta = deltas[d];
+                if ((delta % (int64_t)SEC) != 0) {
+                    continue;
+                }
+                const int64_t src = (int64_t)tgt - delta;
+                if (src < 0) {
+                    continue;
+                }
+                if ((uint64_t)src + len > old_bytes) {
+                    continue;
+                }
+                const uint32_t c =
+                    csd_crc32c(0, old_data.data() + (uint64_t)src, (size_t)len);
+                if (c == me[i].crc32c) {
+                    found = (int64_t)d;
+                }
+            }
+
+            if (found < 0) {
+                continue;   /* 弱哈希未命中：不进表，主机按补集当字面量处理 */
+            }
+
+            /* ---- 强校验：只对候选块 ---- */
+            nr_cand_sh++;
+            {
+                nbuf.resize((size_t)len);
+                uint64_t done = 0;
+                bool rd_ok = true;
+                while (done < len) {
+                    const ssize_t r = pread(fd_new_sv, nbuf.data() + done,
+                                            (size_t)(len - done),
+                                            (off_t)(tgt + done));
+                    if (r <= 0) { rd_ok = false; break; }
+                    done += (uint64_t)r;
+                }
+                if (!rd_ok) {
+                    nr_strong_drop++;
+                    continue;
+                }
+                const uint64_t src = (uint64_t)((int64_t)tgt - deltas[found]);
+                uint8_t h_old[CSD_SHA1_LEN], h_new[CSD_SHA1_LEN];
+                csd_sha1(old_data.data() + src, len, h_old);
+                csd_sha1(nbuf.data(), len, h_new);
+                strong_bytes += len;
+                if (memcmp(h_old, h_new, CSD_SHA1_LEN) != 0) {
+                    nr_strong_drop++;
+                    continue;
+                }
+            }
+
+            struct match_ent *m =
+                (struct match_ent *)(void *)(mtab_out + nr_matched * MATCH_ENT_BYTES);
+            m->tgt_off   = tgt;
+            m->len       = (uint32_t)len;
+            m->delta_idx = (uint32_t)found;
+            nr_matched++;
+        }
+
+        close(fd_new_sv);
+
+        printf("    强校验 SHA-1: 候选 %llu 块, 淘汰 %llu 块, 读 f' %llu B (经 PCIe)\n",
+               (unsigned long long)nr_cand_sh,
+               (unsigned long long)nr_strong_drop,
+               (unsigned long long)strong_bytes);
+
+        if (pwrite(io_mtab_srv, mtab_out, (size_t)mtab_io, 0) != (ssize_t)mtab_io) {
+            perror("写匹配表");
+            free(mtab_out);
+            return 1;
+        }
+        free(mtab_out);
+
+        r_fold = (long long)nr_matched;
         t_srv = now_ms() - f0;
     }
     (void)r_fold;
 
-    printf("[3] server CSD 网格折叠     : 折叠次数 %llu × %llu 候选偏移（上下界相同）, "
-           "命令往返 %.2f ms, 扫描 f 的数据字节 0\n",
-           (unsigned long long)N, (unsigned long long)nr_deltas, t_srv);
+    printf("[3] 主机读 f + 折叠        : 折叠次数 %llu × %llu 候选偏移, "
+           "经 PCIe 读 f %llu B, 耗时 %.2f ms, 命中 %llu 条\n",
+           (unsigned long long)N, (unsigned long long)nr_deltas,
+           (unsigned long long)old_size, t_srv, (unsigned long long)nr_matched);
 
     /* ---------- 7. 线上 #2：匹配表 server -> client ---------- */
     std::vector<struct match_ent> mtab;
@@ -1110,8 +1211,6 @@ int main(int argc, char **argv)
         struct ioctl_create_mrs d {};
         d.rsid = mrs_c.rsid;
         ioctl(cli.ctl_fd, IOCTL_CEMU_DELETE_MRS, &d);
-        d.rsid = mrs_s.rsid;
-        ioctl(srv.ctl_fd, IOCTL_CEMU_DELETE_MRS, &d);
     }
 
     close(fd_old); close(fd_new); close(fd_tgt);

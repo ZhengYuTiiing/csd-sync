@@ -39,6 +39,7 @@
 
 /* 与设备侧同源的指纹实现，避免两份代码漂移导致永不匹配 */
 #include "../../hw/femu/backend/csd_fingerprint.h"
+#include "../../hw/femu/backend/csd_sha1.h"
 
 #define CSD_CTL_DEV "/dev/nvme0c3"
 #define CSD_NG_DEV  "/dev/ng0n3"
@@ -173,6 +174,21 @@ static bool read_full(int fd, void *buf, size_t len)
             return false;
         }
         got += (size_t)r;
+    }
+    return true;
+}
+
+/* 从指定偏移写满 len 字节（主机侧重建用） */
+static bool write_full_at(int fd, const void *buf, size_t len, off_t off)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t r = pwrite(fd, (const uint8_t *)buf + done, len - done,
+                           (off_t)(off + (off_t)done));
+        if (r <= 0) {
+            return false;
+        }
+        done += (size_t)r;
     }
     return true;
 }
@@ -490,6 +506,84 @@ int main(int argc, char **argv)
         }
     }
 
+    /*
+     * ---------- Phase 1.5：强校验（只对候选块） ----------
+     * 设备内那一级（csd_fp256）只当弱哈希挑候选。按统一口径，
+     * 候选块还要在主机上过一道真 SHA-1：
+     *   - 新文件块：已在内存的 new_data，直接算
+     *   - 老文件块：经 PCIe pread 读进主机再算
+     * 不一致的降级为字面量。
+     */
+    uint32_t nr_strong_drop = 0;
+    {
+        auto ts0 = std::chrono::high_resolution_clock::now();
+
+        int fd_so = open(old_path.c_str(), O_RDONLY);
+        if (fd_so < 0) { perror("open old(强校验)"); return 1; }
+
+        std::vector<uint8_t> obuf;
+        uint64_t nr_cand = 0, bytes_old = 0;
+
+        uint32_t i = 0;
+        while (i < nr_new_pages) {
+            if (old_of_new[i] == UINT32_MAX) {
+                i++;
+                continue;
+            }
+            /* 新块号与老块号同时连续 -> 合并成一次 pread */
+            uint32_t j = i + 1;
+            while (j < nr_new_pages &&
+                   old_of_new[j] != UINT32_MAX &&
+                   old_of_new[j] == old_of_new[i] + (j - i)) {
+                j++;
+            }
+
+            const uint64_t run_blk = (uint64_t)(j - i);
+            const uint64_t run_bytes = run_blk * BLK;
+            const uint64_t ooff = (uint64_t)old_of_new[i] * BLK;
+
+            obuf.resize((size_t)run_bytes);
+            uint64_t done = 0;
+            bool read_ok = true;
+            while (done < run_bytes) {
+                const ssize_t r = pread(fd_so, obuf.data() + done,
+                                        (size_t)(run_bytes - done),
+                                        (off_t)(ooff + done));
+                if (r <= 0) { read_ok = false; break; }
+                done += (uint64_t)r;
+            }
+            if (!read_ok) {
+                for (uint32_t k = i; k < j; k++) {
+                    old_of_new[k] = UINT32_MAX;
+                    nr_strong_drop++;
+                }
+                i = j;
+                continue;
+            }
+
+            for (uint32_t k = 0; k < run_blk; k++) {
+                uint8_t h_new[CSD_SHA1_LEN], h_old[CSD_SHA1_LEN];
+                csd_sha1(new_data.data() + (size_t)(i + k) * BLK, BLK, h_new);
+                csd_sha1(obuf.data() + (size_t)k * BLK, BLK, h_old);
+
+                nr_cand++;
+                bytes_old += BLK;
+                if (memcmp(h_new, h_old, CSD_SHA1_LEN) != 0) {
+                    old_of_new[i + k] = UINT32_MAX;
+                    nr_strong_drop++;
+                }
+            }
+            i = j;
+        }
+        close(fd_so);
+
+        auto ts1 = std::chrono::high_resolution_clock::now();
+        printf("Phase1.5 强校验 SHA-1: 候选 %lu 块, 淘汰 %u 块, "
+               "读老文件 %lu B (经 PCIe), 耗时 %ld us\n",
+               (unsigned long)nr_cand, nr_strong_drop, (unsigned long)bytes_old,
+               (long)std::chrono::duration_cast<std::chrono::microseconds>(ts1 - ts0).count());
+    }
+
     uint32_t nr_lit = 0;
     for (uint32_t i = 0; i < nr_new_pages; i++) {
         if (old_of_new[i] == UINT32_MAX) {
@@ -501,107 +595,92 @@ int main(int argc, char **argv)
            nr_new_pages - nr_lit, nr_lit, (unsigned long)nr_lit * BLK,
            (double)nr_lit * 100.0 * BLK / (double)new_size);
 
-    /* ---------- Phase 3：CSD 内重构并写回 NVM（按段提交） ---------- */
+    /* ---------- Phase 3：主机侧重建（数据经 PCIe 读回主机内存，再写目标） ---------- */
     /*
-     * 单条命令的数据缓冲区受 MDTS 限制（本机 mdts=12，约 2MB），
-     * 而变更块字面量可能远超这个值，因此把新文件切成若干段逐段重构写回。
-     * 每段都以"整个老文件"作为输入，保证 COPY_OLD 的块索引始终是全局有效的；
-     * 输出段只覆盖目标文件中对应的那段区间。
+     * 与其它各组口径统一：不再用 rsync_patch 在设备内重构写回，
+     * 改成「pread 老文件块 -> 主机内存 -> pwrite 目标文件」，字面量从
+     * 已在主机内存里的 new_data 取。连续且老块号也连续的 COPY_OLD 合并成
+     * 一段，减少系统调用次数。
      */
-    const uint64_t MAX_SEG_BYTES = 1ULL << 20;   /* 每段 1MB，留足余量 */
+    const size_t RB_BUF = 1ULL << 20;           /* 重建搬运缓冲 1MB */
 
-    struct ioctl_create_mrs mrs_b {};
-    prep_mrs(&mrs_b, 2);
-    mrs_b.fd[0] = p_out;  mrs_b.off[0] = 0;
-    mrs_b.size[0] = (long long)std::min<uint64_t>(MAX_SEG_BYTES, new_size);
-    mrs_b.fd[1] = d_old;  mrs_b.off[1] = 0; mrs_b.size[1] = (long long)old_size;
-    if (ioctl(ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs_b) != 0) {
-        perror("CREATE_MRS(patch)");
-        return 1;
-    }
+    int fd_old_rb = open(old_path.c_str(), O_RDONLY);
+    if (fd_old_rb < 0) { perror("open old(重建)"); return 1; }
+    int fd_tgt_rb = open(tgt_path.c_str(), O_WRONLY);
+    if (fd_tgt_rb < 0) { perror("open target(重建)"); return 1; }
+
+    std::vector<uint8_t> rb_buf(RB_BUF);
 
     auto t2 = std::chrono::high_resolution_clock::now();
     uint32_t seg_start = 0;
     int nr_seg = 0;
+    uint64_t moved = 0;
+    bool rb_ok = true;
 
-    while (seg_start < nr_new_pages) {
-        /* 段内块数同时受"字节上限"和"字面量上限"约束 */
+    while (seg_start < nr_new_pages && rb_ok) {
+        const bool is_lit = (old_of_new[seg_start] == UINT32_MAX);
         uint32_t seg_end = seg_start;
-        uint64_t seg_lit = 0;
-        while (seg_end < nr_new_pages) {
-            const uint64_t add = (old_of_new[seg_end] == UINT32_MAX) ? BLK : 0;
-            if (seg_end > seg_start &&
-                ((seg_end - seg_start + 1) * BLK > MAX_SEG_BYTES ||
-                 seg_lit + add > MAX_SEG_BYTES)) {
+
+        if (!is_lit) {
+            /* 合并连续的、且老块号也连续的 COPY_OLD */
+            while (seg_end < nr_new_pages &&
+                   old_of_new[seg_end] != UINT32_MAX &&
+                   old_of_new[seg_end] == old_of_new[seg_start] + (seg_end - seg_start)) {
+                seg_end++;
+            }
+        } else {
+            while (seg_end < nr_new_pages && old_of_new[seg_end] == UINT32_MAX) {
+                seg_end++;
+            }
+        }
+
+        const uint64_t off_out = (uint64_t)seg_start * BLK;
+        const uint64_t len = (uint64_t)(seg_end - seg_start) * BLK;
+
+        if (is_lit) {
+            /* 字面量：源已经在主机内存的 new_data 里 */
+            if (!write_full_at(fd_tgt_rb, new_data.data() + off_out, (size_t)len,
+                               (off_t)off_out)) {
+                perror("pwrite literal");
+                rb_ok = false;
                 break;
             }
-            seg_lit += add;
-            seg_end++;
-        }
-
-        const uint32_t nblk = seg_end - seg_start;
-        const size_t fixed = sizeof(struct rsync_delta_hdr) +
-                             (size_t)nblk * sizeof(struct rsync_delta_cmd);
-        std::vector<uint8_t> delta(fixed + (size_t)(seg_lit / BLK) * BLK, 0);
-
-        auto *dh = (struct rsync_delta_hdr *)delta.data();
-        dh->magic = RSYNC_DELTA_MAGIC;
-        dh->nr_cmds = nblk;
-        dh->blk_size = BLK;
-        dh->data_pool_offset = (uint32_t)fixed;
-
-        auto *cmds = (struct rsync_delta_cmd *)(delta.data() + sizeof(*dh));
-        uint8_t *pool = delta.data() + fixed;
-        uint32_t li = 0;
-
-        for (uint32_t i = 0; i < nblk; i++) {
-            const uint32_t nb = seg_start + i;
-            cmds[i].blk_idx = i;                 /* 段内局部块号 */
-            if (old_of_new[nb] != UINT32_MAX) {
-                cmds[i].cmd_type = RSYNC_CMD_COPY_OLD;
-                cmds[i].old_blk_idx = old_of_new[nb];   /* 全局老块号 */
-                cmds[i].data_offset = 0;
-            } else {
-                cmds[i].cmd_type = RSYNC_CMD_INSERT_LIT;
-                cmds[i].old_blk_idx = 0;
-                cmds[i].data_offset = li * BLK;
-                memcpy(pool + (size_t)li * BLK, new_data.data() + (size_t)nb * BLK, BLK);
-                li++;
+        } else {
+            const uint64_t off_in = (uint64_t)old_of_new[seg_start] * BLK;
+            uint64_t done = 0;
+            while (done < len) {
+                const size_t want = (size_t)std::min<uint64_t>(RB_BUF, len - done);
+                ssize_t r = pread(fd_old_rb, rb_buf.data(), want, (off_t)(off_in + done));
+                if (r <= 0) { perror("pread old"); rb_ok = false; break; }
+                if (!write_full_at(fd_tgt_rb, rb_buf.data(), (size_t)r,
+                                   (off_t)(off_out + done))) {
+                    perror("pwrite target");
+                    rb_ok = false;
+                    break;
+                }
+                done += (uint64_t)r;
             }
         }
 
-        std::vector<NvmeCopyFormat2> out_cf;
-        const int nr_out = slice_cf(tgt_cf, nr_tgt,
-                                    (uint64_t)seg_start * BLK, (uint64_t)nblk * BLK, out_cf);
-        if (nr_out <= 0) {
-            fprintf(stderr, "第 %d 段的目标区间切片失败\n", nr_seg);
-            return 1;
-        }
-
-        long long patch_ret = -1;
-        int r = run_indirect(ng_fd, pind_patch, mrs_b.rsid, 0, 0,
-                             /*destination=*/1, /*read_mode=*/CSD_READ_MODE_DATA,
-                             old_cf, nr_old, out_cf.data(), nr_out,
-                             delta.data(), delta.size(),
-                             (uint32_t)(old_size / LBA_SIZE) - 1, &patch_ret);
-        if (r < 0) {
-            fprintf(stderr, "rsync_patch 第 %d 段失败: %d (%s)\n", nr_seg, r, strerror(-r));
-            return 1;
-        }
-
+        moved += len;
         seg_start = seg_end;
         nr_seg++;
     }
 
+    close(fd_old_rb);
+    close(fd_tgt_rb);
     auto t3 = std::chrono::high_resolution_clock::now();
 
-    /*
-     * 设备把重构结果直接写进了 NVM 后端，绕过了 guest 的块层，
-     * 且 indirect 路径不会把 CSF 返回值回填到原始请求，故写回量按块数推导。
-     */
-    printf("Phase3 rsync_patch: 完成, %d 段, 设备内写回 %u 个 512B 扇区 (%u 块), 耗时 %ld us\n",
-           nr_seg, nr_new_pages * (BLK / LBA_SIZE), nr_new_pages,
-           (long)std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count());
+    if (!rb_ok) {
+        return 1;
+    }
+
+    printf("Phase3 主机重建: 完成, %d 段, 搬运 %lu B (%u 块), 耗时 %ld us, %.1f MB/s\n",
+           nr_seg, (unsigned long)moved, nr_new_pages,
+           (long)std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count(),
+           (double)moved / 1048576.0 /
+               ((double)std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count()
+                / 1e6));
 
     /* ---------- 校验：目标文件是否等于新文件 ---------- */
     /*
@@ -642,8 +721,6 @@ int main(int argc, char **argv)
     ioctl(ctl_fd, IOCTL_CEMU_DEACTIVATE, &dl);
     ioctl(ctl_fd, IOCTL_CEMU_UNLOAD, &dl);
 
-    ioctl(ctl_fd, IOCTL_CEMU_DELETE_MRS, &mrs_b);
-    free(mrs_b.fd); free(mrs_b.off); free(mrs_b.size);
     free(old_cf); free(tgt_cf);
     close(m_out); close(d_in); close(d_old); close(p_out);
     close(ng_fd); close(ctl_fd);
